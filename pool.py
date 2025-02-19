@@ -2,37 +2,96 @@ import requests
 import os
 import subprocess
 import time
+from config import (
+    API_URL,
+    POOL_TOKEN,
+    ADDITIONAL_ADDRESS,
+    BATCH_SIZE,
+    SLEEP_TIME
+)
+from typing import List, Dict, Optional
+import logging
+import re
+from tenacity import retry, stop_after_attempt, wait_exponential
+from enum import Enum
 
-API_URL = "https://bitcoinflix.replit.app/api/block"
-POOL_TOKEN = ""
-ADDITIONAL_ADDRESS = "1BY8GQbnueYofwSuFAT3USAhGjPrkxDdW9"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Mover para config.py
+GPU_SETTINGS = {
+    "threads": "0",
+    "gpu_id": "0",
+    "grid_size": "1536"
+}
+
+class ProgramState(Enum):
+    INITIALIZING = "initializing"
+    FETCHING = "fetching"
+    PROCESSING = "processing"
+    ERROR = "error"
+    COMPLETED = "completed"
 
 def clear_screen():
     """Limpa a tela do terminal."""
-    os.system("cls" if os.name == "nt" else "clear")
+    os.system('cls' if os.name == 'nt' else 'clear')
 
-def fetch_block_data():
+def fetch_block_data() -> Optional[Dict]:
     headers = {"pool-token": POOL_TOKEN}
     try:
-        response = requests.get(API_URL, headers=headers)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Erro ao buscar dados do bloco: {response.status_code} - {response.text}")
-            return None
+        response = requests.get(API_URL, headers=headers, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except requests.Timeout:
+        logging.error("Timeout ao buscar dados do bloco")
     except requests.RequestException as e:
-        print(f"Erro ao fazer a requisição: {e}")
-        return None
+        logging.error(f"Erro ao fazer a requisição: {e}")
+    return None
 
-def save_addresses_to_file(addresses, additional_address, filename="in.txt"):
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def fetch_block_data_with_retry() -> Optional[Dict]:
+    """
+    Busca dados do bloco com retry automático em caso de falha.
+    """
+    return fetch_block_data()
+
+def validate_address(address: str) -> bool:
+    """
+    Valida se o endereço Bitcoin é válido.
+    
+    Args:
+        address: Endereço Bitcoin a ser validado
+        
+    Returns:
+        bool: True se o endereço é válido, False caso contrário
+    """
+    # Padrão básico para endereços Bitcoin
+    pattern = r'^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$'
+    return bool(re.match(pattern, address))
+
+def save_addresses_to_file(
+    addresses: List[str], 
+    additional_address: str, 
+    filename: str = "in.txt"
+) -> None:
+    if not addresses:
+        logging.error("Lista de endereços vazia")
+        return
+        
+    if not validate_address(additional_address):
+        logging.error(f"Endereço adicional inválido: {additional_address}")
+        return
+        
     try:
         with open(filename, "w") as file:
             for address in addresses:
                 file.write(address + "\n")
             file.write(additional_address + "\n")  # Adicionando o endereço adicional
-        print(f"Endereços salvos com sucesso no arquivo '{filename}'.")
+        logging.info("Endereços salvos com sucesso")
     except Exception as e:
-        print(f"Erro ao salvar endereços no arquivo: {e}")
+        logging.error(f"Erro ao salvar endereços no arquivo: {e}")
 
 def clear_file(filename):
     try:
@@ -42,53 +101,61 @@ def clear_file(filename):
     except Exception as e:
         print(f"Erro ao limpar o arquivo '{filename}': {e}")
 
-def run_program(start, end):
-    keyspace = f"{start}:{end}"
+def run_program(start: str, end: str) -> None:
     command = [
         "./vanitysearch",
-        "-t", "0",
+        "-t", GPU_SETTINGS["threads"],
         "-gpu",
-        "-gpuId", "0",
-        "-g", "1536",
+        "-gpuId", GPU_SETTINGS["gpu_id"],
+        "-g", GPU_SETTINGS["grid_size"],
         "-i", "in.txt",
         "-o", "out.txt",
-        "--keyspace", keyspace
+        "--keyspace", f"{start}:{end}"
     ]
     try:
-        print(f"Executando o programa com keyspace {keyspace}...")
+        logging.info(f"Executando o programa com keyspace {f'{start}:{end}'}...")
         subprocess.run(command, check=True)
-        print("Programa executado com sucesso.")
+        logging.info("Programa executado com sucesso.")
     except subprocess.CalledProcessError as e:
-        print(f"Erro ao executar o programa: {e}")
+        logging.error(f"Erro ao executar o programa: {e}")
     except Exception as e:
-        print(f"Erro inesperado: {e}")
+        logging.error(f"Erro inesperado: {e}")
 
-def post_private_keys(private_keys):
+def post_private_keys(private_keys: List[str]) -> bool:
+    """
+    Envia chaves privadas para a API.
+    
+    Args:
+        private_keys: Lista de chaves privadas
+        
+    Returns:
+        bool: True se o envio foi bem sucedido, False caso contrário
+    """
     headers = {
         "pool-token": POOL_TOKEN,
         "Content-Type": "application/json"
     }
     data = {"privateKeys": private_keys}
     
-    print(f"Enviando o seguinte array de chaves privadas ({len(private_keys)} chaves):")
-    print(private_keys)
+    logging.info(f"Enviando {len(private_keys)} chaves privadas")
     
     try:
-        response = requests.post(API_URL, headers=headers, json=data)
-        if response.status_code == 200:
-            print(f"Chaves privadas enviadas com sucesso.")
-        else:
-            print(f"Erro ao enviar chaves privadas: {response.status_code} - {response.text}")
+        with requests.Session() as session:
+            response = session.post(API_URL, headers=headers, json=data)
+            response.raise_for_status()
+            logging.info("Chaves privadas enviadas com sucesso")
+            return True
     except requests.RequestException as e:
-        print(f"Erro ao fazer a requisição POST: {e}")
-
-def process_out_file(out_file="out.txt", in_file="in.txt", additional_address=ADDITIONAL_ADDRESS):
-    if not os.path.exists(out_file):
-        print(f"Arquivo '{out_file}' não encontrado.")
+        logging.error(f"Erro ao fazer a requisição POST: {e}")
         return False
 
-    if not os.path.exists(in_file):
-        print(f"Arquivo '{in_file}' não encontrado.")
+def process_out_file(
+    out_file: str = "out.txt",
+    in_file: str = "in.txt",
+    additional_address: str = ADDITIONAL_ADDRESS
+) -> bool:
+    if not all(os.path.exists(f) for f in [out_file, in_file]):
+        logging.error("Arquivos necessários não encontrados")
         return False
 
     private_keys = {}
@@ -140,38 +207,77 @@ def process_out_file(out_file="out.txt", in_file="in.txt", additional_address=AD
             else:
                 print(f"Lote com menos de 10 chaves ignorado: {batch}")
 
-    except Exception as e:
+    except (IOError, ValueError) as e:
         print(f"Erro ao processar os arquivos: {e}")
 
     # Limpar o arquivo out.txt
     clear_file(out_file)
     return False
 
-# Loop Principal
-if __name__ == "__main__":
-    while True:
-        clear_screen()
-        block_data = fetch_block_data()
-        if block_data:
-            addresses = block_data.get("checkwork_addresses", [])
-            if addresses:
-                save_addresses_to_file(addresses, ADDITIONAL_ADDRESS)
-                
-                # Extraindo start e end do range
-                range_data = block_data.get("range", {})
-                start = range_data.get("start", "").replace("0x", "")
-                end = range_data.get("end", "").replace("0x", "")
-                
-                if start and end:
-                    run_program(start, end)
-                    if process_out_file():
-                        break
-                else:
-                    print("Erro: Start ou End não encontrado no range.")
-            else:
-                print("Nenhum endereço encontrado no bloco.")
-        else:
-            print("Erro ao buscar dados do bloco.")
+def validate_block_data(block_data: Dict) -> bool:
+    """
+    Valida os dados do bloco recebidos da API.
+    
+    Args:
+        block_data: Dicionário com os dados do bloco
+        
+    Returns:
+        bool: True se os dados são válidos, False caso contrário
+    """
+    required_fields = ["checkwork_addresses", "range"]
+    return all(field in block_data for field in required_fields)
 
-        # Aguardar 2 segundos antes de reiniciar o loop
-        time.sleep(2)
+def process_private_keys_batch(private_keys: List[str], batch_size: int = 10) -> None:
+    """
+    Processa as chaves privadas em lotes.
+    
+    Args:
+        private_keys: Lista de chaves privadas
+        batch_size: Tamanho do lote para processamento
+    """
+    total_keys = len(private_keys)
+    for i in range(0, total_keys, batch_size):
+        batch = private_keys[i:i + batch_size]
+        if len(batch) == batch_size:
+            if not post_private_keys(batch):
+                logging.warning(f"Falha ao processar lote {i//batch_size + 1}")
+        else:
+            logging.info(f"Ignorando lote incompleto com {len(batch)} chaves")
+
+def main() -> None:
+    """Função principal do programa com controle de estado."""
+    state = ProgramState.INITIALIZING
+    retry_count = 0
+    max_retries = 3
+    
+    while state != ProgramState.COMPLETED:
+        try:
+            if state == ProgramState.INITIALIZING:
+                clear_screen()
+                state = ProgramState.FETCHING
+                
+            elif state == ProgramState.FETCHING:
+                block_data = fetch_block_data_with_retry()
+                if block_data:
+                    state = ProgramState.PROCESSING
+                else:
+                    raise ValueError("Falha ao buscar dados do bloco")
+                    
+            elif state == ProgramState.PROCESSING:
+                if process_block():
+                    state = ProgramState.COMPLETED
+                    
+        except KeyboardInterrupt:
+            logging.info("Programa interrompido pelo usuário")
+            break
+        except Exception as e:
+            logging.error(f"Erro no estado {state}: {e}")
+            retry_count += 1
+            if retry_count >= max_retries:
+                state = ProgramState.ERROR
+                break
+            state = ProgramState.INITIALIZING
+            time.sleep(SLEEP_TIME)
+
+if __name__ == "__main__":
+    main()
